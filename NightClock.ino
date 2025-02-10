@@ -1,58 +1,64 @@
-#include <time.h>
-#include <ESP8266WiFi.h>
-#include <WiFiUdp.h>
 #include "credentials.h"
 #include "config.h"
+#include <WiFiNINA.h>
+#include <RTCZero.h>
+#include <time.h>
 
 
-typedef struct LED_t {
-	uint8_t r;
-	uint8_t g;
-	uint8_t b;	
-} LED_t;
-
-// UTC
-const struct tm bedTime = { .tm_sec = 0, .tm_min = 0, .tm_hour = 17 };
-const struct tm wakeupTime = { .tm_sec = 0, .tm_min = 0, .tm_hour = 5 };
-
-unsigned char packetBuffer[NTP_PACKET_SIZE]; // buffer to hold incoming and outgoing packets
-WiFiUDP udp; // A UDP instance to let us send and receive packets over UDP
 LED_t led;
-time_t timestamp;
+RTCZero mcuRtc;
 struct tm currentTime;
-struct tm bedLastCheck, wakeupLastCheck;
-uint8_t step;
+volatile enum StateMachine step, nextAlarm;
+
+
+void alarm()
+{
+	Serial.println("Alarm");
+	step = nextAlarm;
+}
 
 
 void setup()
 {
-	led = { .r = 0, .g = 0, .b = 0 };
-	step = 99;
+	led = { .r = 0, .g = 0 };
 	
 	pinMode(LED_R_PIN, OUTPUT);
 	pinMode(LED_G_PIN, OUTPUT);
-	pinMode(LED_B_PIN, OUTPUT);
-	analogWrite(LED_B_PIN, 1);
+	pinMode(PWR_LED_PIN, OUTPUT);
+	pinMode(USER_LED_PIN, OUTPUT);
 	
 	Serial.begin(DEBUG_BAUDRATE);
 	Serial.setTimeout(1000);
-	while (!Serial);
+	uint8_t serialStartupDelay = 50;
+	while(!Serial && --serialStartupDelay)
+	{
+		delay(100);
+	}
 	Serial.println("\nHello!");
 	
-	// Delay is somehow necessary to successfully establish a WiFi connection after DeepSleep.
-	delay(1);
+	time_t ntpTime = getNtpTime();
+
+	mcuRtc.begin();
+	mcuRtc.setEpoch(ntpTime);
+	mcuRtc.setFrequencyCorrection(RTC_CALIB_VALUE);
+	mcuRtc.attachInterrupt(alarm);
+	mcuRtc.enableAlarm(mcuRtc.MATCH_HHMMSS);
+
+	Serial.print("NTP time: ");
+	char* cTime = ctime(&ntpTime);
+	Serial.print(cTime); // ctime() seems to add some line break
 	
-	if (connectWifi() != 0)
+	step = AFTER_STARTUP;
+	if (isBetweenAlarms(ntpTime, BED_TIME, WAKEUP_TIME))
 	{
-		connectionError();
+		step = BED_TIME;
+	}
+	else if (isBetweenAlarms(ntpTime, WAKEUP_TIME, OFF_TIME))
+	{
+		step = WAKEUP_TIME;
 	}
 	
-	timestamp = getNtpTime();
-	gmtime_r(&timestamp, &bedLastCheck);
-	gmtime_r(&timestamp, &wakeupLastCheck);
-	Serial.printf("NTP time: %s", ctime(&timestamp));	// ctime() seems to add some line break
-	
-	analogWrite(LED_B_PIN, 0);
+	setupNextAlarm();
 }
 
 
@@ -60,88 +66,220 @@ void loop()
 {
 	switch(step)
 	{
-		case 0:
+		case AFTER_STARTUP:
+			delay(30 * 1000);
+			step = IDLE;
+			break;
+		
+		case IDLE:
+			mcuRtc.standbyMode();
+			break;
+		
+		case TIME_SYNC:
+			updateRtcTime();
+			setupNextAlarm();
+			step = IDLE;
+			break;
+			
+		case BED_TIME:
 			if (led.g == 0)
 			{
-				step++;
+				step = BED_TIME_II;
 				break;
 			}
 			--led.g;
 			writeLED(&led);
 			delay((1000 / BRIGHTNESS_STEPS));
 			break;
-			
-		case 1:
+		
+		case BED_TIME_II:
 			writeLED(&led);
 			led.r++;
 			delay((1000 / BRIGHTNESS_STEPS));
-			if (led.r >= BRIGHTNESS_STEPS) step = 99;
+			if (led.r >= BRIGHTNESS_STEPS)
+			{
+				setupNextAlarm();
+				step = IDLE;
+			}
 			break;
-
-		case 10:
+		
+		case WAKEUP_TIME:
 			if (led.r == 0)
 			{
-				step++;
+				step = WAKEUP_TIME_II;
 				break;
 			}
 			--led.r;
 			writeLED(&led);
 			delay((1000 / BRIGHTNESS_STEPS));
 			break;
-
-		case 11:
+		
+		case WAKEUP_TIME_II:
 			writeLED(&led);
 			led.g++;
 			delay((1000 / BRIGHTNESS_STEPS));
-			if (led.g >= BRIGHTNESS_STEPS / 2) step = 99;
+			if (led.g >= BRIGHTNESS_STEPS)
+			{
+				setupNextAlarm();
+				step = IDLE;				
+			}
 			break;
 		
-		case 99:
-			delay(60 * 1000);
-			
-			timestamp = getNtpTime();
-			gmtime_r(&timestamp, &currentTime);
-			Serial.printf("NTP time: %s", ctime(&timestamp));	// ctime() seems to add some line break
-			
-			if (timeCrossed(&bedTime, &bedLastCheck, &currentTime))
+		case OFF_TIME:
+			if (led.r > 0) --led.r;
+			if (led.g > 0) --led.g;
+			writeLED(&led);
+			delay((1000 / BRIGHTNESS_STEPS));
+			if (led.r == 0 && led.g == 0)
 			{
-				Serial.println("Bed Time crossed!");
-				step = 0;
-			}
-			else if (timeCrossed(&wakeupTime, &wakeupLastCheck, &currentTime))
-			{
-				Serial.println("Wakeup Time crossed!");
-				step = 10;
+				setupNextAlarm();
+				step = IDLE;
 			}
 			break;
 	}
 }
 
 
-void writeLED(const LED_t* led)
+void setupNextAlarm()
 {
-	const uint8_t brightnessCorrectionTable[BRIGHTNESS_STEPS] = { 0, 1, 2, 3, 4, 7, 11, 17, 28, 45, 69, 102, 141, 183, 255, 255 };
-	analogWrite(LED_R_PIN, brightnessCorrectionTable[led->r]);
-	analogWrite(LED_G_PIN, brightnessCorrectionTable[led->g]);
-	analogWrite(LED_B_PIN, brightnessCorrectionTable[led->b]);
+	time_t rtc = mcuRtc.getEpoch();
+	struct tm* rtcTime = gmtime(&rtc);
+	
+	long dt[ALARM_COUNT];
+	for (uint8_t i = 0; i < ALARM_COUNT; i++)
+	{
+		dt[i] = calculateDeltaSeconds(&alarms[i].time, rtcTime);
+	}
+	
+	// Search for alarms in the past, then shift them to the next day (add +24h)
+	for (uint8_t i = 0; i < ALARM_COUNT; i++)
+	{
+		if (dt[i] < 0)
+		{
+			dt[i] += ONE_DAY;
+		}
+	}
+
+	// Search for minimum
+	long minDt = dt[0];
+	uint8_t minIndex = 0;
+	for (uint8_t i = 0; i < ALARM_COUNT; i++)
+	{
+		if (dt[i] < minDt)
+		{
+			minDt = dt[i];
+			minIndex = i;
+		}
+	}
+	const Alarm_t* pAlarm = &alarms[minIndex];
+	
+	char msg[50];
+	sprintf(msg, "Next alarm: %s @ %02d:%02d:%02d\n", pAlarm->name, pAlarm->time.tm_hour, pAlarm->time.tm_min, pAlarm->time.tm_sec);
+	Serial.print(msg);
+	
+	mcuRtc.setAlarmTime(pAlarm->time.tm_hour, pAlarm->time.tm_min, pAlarm->time.tm_sec);
+	nextAlarm = pAlarm->opState;
 }
 
 
-unsigned char connectWifi()
+bool isBetweenAlarms(const time_t now, const enum StateMachine alarm1, const enum StateMachine alarm2)
 {
-	if (!WiFi.mode(WIFI_STA) || !WiFi.begin(ssid, pass) || (WiFi.waitForConnectResult(WIFI_CONNECTION_TIMEOUT) != WL_CONNECTED))
+	time_t t1, t2;
+	for (uint8_t i = 0; i < ALARM_COUNT; i++)
 	{
-		WiFi.mode(WIFI_OFF);
-		Serial.println("Cannot connect WiFi!");
-		WiFi.printDiag(Serial);
-		Serial.flush();
-		return 1;
+		if (alarms[i].opState == alarm1)
+		{
+			t1 = makeFullAlarmTime(now, &alarms[i].time);
+		}
+		else if (alarms[i].opState == alarm2)
+		{
+			t2 = makeFullAlarmTime(now, &alarms[i].time);
+		}
+	}
+	// Alarm2 is expected to always be after Alarm1, if not, add one day to shift it correctly.
+	if (t2 < t1)
+	{
+		t2 += ONE_DAY;
+	}
+	return (now > t1 && now < t2);
+}
+
+
+void updateRtcTime()
+{
+	time_t ntpTime = getNtpTime();
+	if (ntpTime != 0)
+	{
+		mcuRtc.setEpoch(ntpTime);
+	}
+}
+
+
+time_t getNtpTime()
+{
+	UserLED(ON);
+	if (connectWifi() != 0)
+	{
+		connectionError();
 	}
 	
-	Serial.print("IP address: ");
-	Serial.println(WiFi.localIP());
-	
+#ifdef _DEBUG
+	Serial.print("Get NTP time");
+#endif
+	uint8_t retries = 10;
+	time_t newTime;	
+	do
+	{
+		newTime = WiFi.getTime();
+		if (newTime != 0)
+		{
+#ifdef _DEBUG
+			Serial.println(" done.");
+#endif
+			WiFi.end();
+			UserLED(OFF);
+			return newTime;
+		}
+		delay(3 * 1000);
+	}
+	while (newTime == 0 && --retries > 0);
+
+#ifdef _DEBUG
+	Serial.println(" failed.");
+#endif
+	WiFi.end();
+	UserLED(OFF);
 	return 0;
+}
+
+
+uint8_t connectWifi()
+{
+	uint8_t retries = 10;
+	while (WiFi.status() != WL_CONNECTED && --retries > 0)
+	{
+		Serial.println("Establishing WiFi connection ...");
+		
+		WiFi.setHostname(hostname);
+		if (WiFi.begin(ssid, pass) == WL_CONNECTED)
+		{
+			Serial.print("Connected to '");
+			Serial.print(ssid);
+			Serial.print("'. IP: ");
+			Serial.println(WiFi.localIP());
+			
+			WiFi.lowPowerMode();
+			return 0;
+		}
+		
+		WiFi.end();
+		Serial.print("Cannot connect - Reason code: ");
+		Serial.println(WiFi.reasonCode());
+		
+		delay(3 * 1000);
+	}
+	
+	return 1;
 }
 
 
@@ -149,114 +287,11 @@ void connectionError()
 {
 	while(1)
 	{
-		analogWrite(LED_B_PIN, 0);
+		UserLED(OFF);
 		delay(500);
-		analogWrite(LED_B_PIN, 1);
+		UserLED(ON);
 		delay(500);
 	}
-}
-
-time_t getNtpTime()
-{
-#ifdef _DEBUG
-	Serial.print("Starting UDP ... ");
-#endif
-	udp.begin(LOCAL_PORT);
-#ifdef _DEBUG
-	Serial.printf("local port: %u\n", udp.localPort());
-#endif
-	
-	char resendRetries = 6;
-	while (resendRetries)
-	{
-		sendNtpRequest();
-	
-		// Wait for response (max. 100 x 100ms = 10s)
-		int replyLength = 0;
-		char receiveRetries = 100;
-		do
-		{
-			delay(100);
-			replyLength = udp.parsePacket();
-		} while (replyLength == 0 && --receiveRetries > 0);
-			
-		if (replyLength == 0 && receiveRetries == 0)
-		{
-#ifdef _DEBUG
-			Serial.println("No NTP reply received. Retrying...");
-#endif
-			--resendRetries;
-			continue;	// Start sending a new request
-		}
-		
-		// We've received a packet, read the data from it
-		udp.read(packetBuffer, NTP_PACKET_SIZE);
-		
-		return parseNtpResponse(packetBuffer);
-	}
-	
-	return (time_t)0;
-}
-
-
-// send an NTP request to the time server at the given address
-void sendNtpRequest()
-{
-#ifdef _DEBUG
-	Serial.println("Sending NTP packet...");
-#endif
-	
-	IPAddress timeServerIp;
-	// Don't hardwire the IP address or we won't get the benefits of the pool. Lookup the IP address for the host name instead.
-	WiFi.hostByName(NTP_SERVER_NAME, timeServerIp);
-	
-	// set all bytes in the buffer to 0
-	memset(packetBuffer, 0, NTP_PACKET_SIZE);
-	// Initialize values needed to form NTP request
-	// (see URL above for details on the packets)
-	packetBuffer[0] = 0b11100011;	// LI, Version, Mode
-	packetBuffer[1] = 0;			// Stratum, or type of clock
-	packetBuffer[2] = 6;			// Polling Interval
-	packetBuffer[3] = 0xEC;			// Peer Clock Precision
-	// 8 bytes of zero for Root Delay & Root Dispersion
-	packetBuffer[12]	= 49;
-	packetBuffer[13]	= 0x4E;
-	packetBuffer[14]	= 49;
-	packetBuffer[15]	= 52;
-
-	// all NTP fields have been given values, now
-	// you can send a packet requesting a timestamp:
-	udp.beginPacket(timeServerIp, NTP_PORT);
-	udp.write(packetBuffer, NTP_PACKET_SIZE);
-	udp.endPacket();
-}
-
-
-time_t parseNtpResponse(const byte* data)
-{	
-	// the timestamp starts at byte 40 of the received packet and is four bytes,
-	// or two words, long. First, esxtract the two words:
-	unsigned long highWord = word(data[40], data[41]);
-	unsigned long lowWord = word(data[42], data[43]);
-	// combine the four bytes (two words) into a long integer
-	// this is NTP time (seconds since Jan 1 1900):
-	unsigned long secsSince1900 = highWord << 16 | lowWord;
-
-	// now convert NTP time into everyday time:
-	// Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
-	const unsigned long seventyYears = 2208988800UL;
-	// subtract seventy years:
-	unsigned long epoch = secsSince1900 - seventyYears;
-	
-	return (time_t)epoch;
-}
-
-
-bool timeCrossed(const struct tm* reference, struct tm* previous, const struct tm* current)
-{
-	bool crossed = (calculateDeltaSeconds(reference, previous) < 0) && (calculateDeltaSeconds(reference, current) > 0);
-	memcpy(previous, current, sizeof(tm));
-	return crossed;
 }
 
 
@@ -265,11 +300,24 @@ long calculateDeltaSeconds(const struct tm* reference, const struct tm* current)
 	// Assume that we're within the same day	
 	long referenceSecsOfDay = reference->tm_hour * 3600 + reference->tm_min * 60 + reference->tm_sec;
 	long currentSecsOfDay = current->tm_hour * 3600 + current->tm_min * 60 + current->tm_sec;
-	return currentSecsOfDay - referenceSecsOfDay;
+	return referenceSecsOfDay - currentSecsOfDay;
 }
 
 
-void printTime(const struct tm* time)
+time_t makeFullAlarmTime(time_t rtcTime, const struct tm* alarmTime)
 {
-	Serial.printf("%2d:%2d:%2d", time->tm_hour, time->tm_min, time->tm_sec);
+	// Alarm time only specifies hh:mm:ss, but for a correct calculation we need a correct time referring to the time epoch
+	struct tm* actualAlarmTime = gmtime(&rtcTime);
+	actualAlarmTime->tm_sec = alarmTime->tm_sec;
+	actualAlarmTime->tm_min = alarmTime->tm_min;
+	actualAlarmTime->tm_hour = alarmTime->tm_hour;
+	return mktime(actualAlarmTime);	
+}
+
+
+void writeLED(const LED_t* led)
+{
+	const uint8_t brightnessCorrectionTable[BRIGHTNESS_STEPS] = { 0, 1, 2, 3, 4, 7, 11, 17, 28, 45, 69, 102, 141, 183, 255, 255 };
+	analogWrite(LED_R_PIN, brightnessCorrectionTable[led->r]);
+	analogWrite(LED_G_PIN, brightnessCorrectionTable[led->g]);
 }
