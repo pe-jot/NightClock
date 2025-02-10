@@ -1,6 +1,7 @@
 #include "credentials.h"
 #include "config.h"
 #include <WiFiNINA.h>
+#include <BQ24195.h>
 #include <RTCZero.h>
 #include <time.h>
 
@@ -20,12 +21,22 @@ void alarm()
 
 void setup()
 {
-	led = { .r = 0, .g = 0 };
+	led = { .r = 0, .g = 0, .b = 0 };
 	
-	pinMode(LED_R_PIN, OUTPUT);
-	pinMode(LED_G_PIN, OUTPUT);
-	pinMode(PWR_LED_PIN, OUTPUT);
 	pinMode(USER_LED_PIN, OUTPUT);
+	pinMode(LED_G_PIN, OUTPUT);
+	pinMode(LED_R_PIN, OUTPUT);
+	pinMode(LED_GND_PIN, OUTPUT);
+
+	analogReference(AR_DEFAULT);
+	analogReadResolution(12);
+	
+	PMIC.begin();
+	PMIC.setInputCurrentLimit(BATT_MAX_INPUT_CURRENT);
+	PMIC.setMinimumSystemVoltage(BATT_EMPTY_VOLTAGE);
+	PMIC.setChargeVoltage(BATT_FULL_VOLTAGE);
+	PMIC.setChargeCurrent(BATT_CHRG_CURRENT);
+	PMIC.enableCharge();
 	
 	Serial.begin(DEBUG_BAUDRATE);
 	Serial.setTimeout(1000);
@@ -72,13 +83,14 @@ void loop()
 			break;
 		
 		case IDLE:
-			mcuRtc.standbyMode();
-			break;
-		
-		case TIME_SYNC:
-			updateRtcTime();
-			setupNextAlarm();
-			step = IDLE;
+			if (!checkBattery())
+			{
+				enterLowBattSleep();
+			}
+			else
+			{
+				mcuRtc.standbyMode();
+			}
 			break;
 			
 		case BED_TIME:
@@ -135,6 +147,13 @@ void loop()
 				setupNextAlarm();
 				step = IDLE;
 			}
+			break;
+
+		case LOW_BATTERY:		
+			UserLED(ON);
+			delay(1);
+			UserLED(OFF);
+			enterLowBattSleep();
 			break;
 	}
 }
@@ -320,4 +339,37 @@ void writeLED(const LED_t* led)
 	const uint8_t brightnessCorrectionTable[BRIGHTNESS_STEPS] = { 0, 1, 2, 3, 4, 7, 11, 17, 28, 45, 69, 102, 141, 183, 255, 255 };
 	analogWrite(LED_R_PIN, brightnessCorrectionTable[led->r]);
 	analogWrite(LED_G_PIN, brightnessCorrectionTable[led->g]);
+}
+
+
+bool checkBattery()
+{
+	// https://docs.arduino.cc/tutorials/mkr-wifi-1010/mkr-battery-app-note/
+	PMIC.disableCharge();
+	delay(500);
+	//const float rawADC = analogRead(ADC_BATTERY);
+	//const float voltADC = rawADC * (3.3 / 4095.0);
+	//const float voltBatt = voltADC * (BATT_MAX_SOURCE_VOLTAGE / 3.3);
+	const float voltBatt = analogRead(ADC_BATTERY) * (3.3 / 4095.0) * (BATT_MAX_SOURCE_VOLTAGE / 3.3);
+	const int chargeLevel = (voltBatt - BATT_EMPTY_VOLTAGE) * (100) / (BATT_FULL_VOLTAGE - BATT_EMPTY_VOLTAGE);
+	PMIC.enableCharge();
+
+	Serial.print("Battery: ");
+	Serial.print(voltBatt);
+	Serial.print(" V / ");
+	Serial.print(chargeLevel);
+	Serial.print(" %\n");
+	Serial.flush();
+
+	return (chargeLevel < 20) ? false : true;
+}
+
+
+void enterLowBattSleep()
+{
+	nextAlarm = LOW_BATTERY;
+	time_t alarmTime = mcuRtc.getEpoch() + 2;
+	struct tm* timeinfo = gmtime(&alarmTime);
+	mcuRtc.setAlarmTime(timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+	mcuRtc.standbyMode();
 }
