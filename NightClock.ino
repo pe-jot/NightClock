@@ -47,6 +47,8 @@ void setup()
 	}
 	Serial.println("\nHello!");
 	
+	ledTest();
+
 	time_t ntpTime = getNtpTime();
 
 	mcuRtc.begin();
@@ -100,12 +102,12 @@ void loop()
 				break;
 			}
 			--led.g;
-			writeLED(&led);
+			writeLED(led);
 			delay((1000 / BRIGHTNESS_STEPS));
 			break;
 		
 		case BED_TIME_II:
-			writeLED(&led);
+			writeLED(led);
 			led.r++;
 			delay((1000 / BRIGHTNESS_STEPS));
 			if (led.r >= BRIGHTNESS_STEPS)
@@ -122,12 +124,12 @@ void loop()
 				break;
 			}
 			--led.r;
-			writeLED(&led);
+			writeLED(led);
 			delay((1000 / BRIGHTNESS_STEPS));
 			break;
 		
 		case WAKEUP_TIME_II:
-			writeLED(&led);
+			writeLED(led);
 			led.g++;
 			delay((1000 / BRIGHTNESS_STEPS));
 			if (led.g >= BRIGHTNESS_STEPS)
@@ -140,7 +142,7 @@ void loop()
 		case OFF_TIME:
 			if (led.r > 0) --led.r;
 			if (led.g > 0) --led.g;
-			writeLED(&led);
+			writeLED(led);
 			delay((1000 / BRIGHTNESS_STEPS));
 			if (led.r == 0 && led.g == 0)
 			{
@@ -334,11 +336,25 @@ time_t makeFullAlarmTime(time_t rtcTime, const struct tm* alarmTime)
 }
 
 
-void writeLED(const LED_t* led)
+void writeLED(const LED_t led)
 {
 	const uint8_t brightnessCorrectionTable[BRIGHTNESS_STEPS] = { 0, 1, 2, 3, 4, 7, 11, 17, 28, 45, 69, 102, 141, 183, 255, 255 };
-	analogWrite(LED_R_PIN, brightnessCorrectionTable[led->r]);
-	analogWrite(LED_G_PIN, brightnessCorrectionTable[led->g]);
+	analogWrite(LED_R_PIN, brightnessCorrectionTable[led.r]);
+	analogWrite(LED_G_PIN, brightnessCorrectionTable[led.g]);
+}
+
+
+void ledTest()
+{
+	Serial.print("LED test .");
+	writeLED({ .r = MAX_BRIGHTNESS, .g = 0, .b = 0 });
+	delay(500);	
+	Serial.print(".");
+	writeLED({ .r = 0, .g = MAX_BRIGHTNESS, .b = 0 });
+	delay(500);
+	Serial.print(".");
+	writeLED({ .r = 0, .g = 0, .b = 0 });
+	Serial.println(" complete.");
 }
 
 

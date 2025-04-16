@@ -9,6 +9,7 @@ const char* hostname =				"mkrwifi1010";
 #define LED_G_PIN					4
 #define LED_GND_PIN					3
 #define BRIGHTNESS_STEPS			16
+#define MAX_BRIGHTNESS				(BRIGHTNESS_STEPS - 1)
 
 #define DEBUG_BAUDRATE				115200
 #define RTC_CALIB_VALUE				0			/* Seems pretty stable thus no correction needed */
