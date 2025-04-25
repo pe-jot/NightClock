@@ -3,7 +3,7 @@
 ### Hardware
 Controller: ATSAMD21 (ARM Cortex M0) on an [Arduino MKR WiFi 1010](https://store.arduino.cc/en-at/collections/iot-cloud-compatible/products/arduino-mkr-wifi-1010)
 
-![Night clock quick & dirty build](NightClock.jpg)
+![Night clock quick & dirty build](hardware.jpg)
 
 ### Short description
 
